@@ -5,6 +5,9 @@
 # NOTES: Obtain the pv to upgrade via "kubectl get pv"         #
 ################################################################
 
+Target_upgrade_version="v0.8.1"
+Current_version="0.8.0"
+
 function usage() {
     echo 
     echo "Usage:"
@@ -19,8 +22,9 @@ function setDeploymentRecreateStrategy() {
     dns=$1 # deployment namespace
     dn=$2  # deployment name
     currStrategy=`kubectl get deploy -n $dns $dn -o jsonpath="{.spec.strategy.type}"`
+    rc=$?; if [ $rc -ne 0 ]; then echo " Failed to get the deplyment stratergy | ERROR: $rc"; exit; fi
 
-    if [ $currStrategy = "RollingUpdate" ]; then
+    if [ $currStrategy != "Recreate" ]; then
        kubectl patch deployment --namespace $dns --type json $dn -p "$(cat patch-strategy-recreate.json)"
        rc=$?; if [ $rc -ne 0 ]; then echo " Upgrade failed | ERROR: $rc"; exit; fi
        echo "Deployment upgrade strategy set as recreate"
@@ -61,9 +65,9 @@ sc_res_ver=`kubectl get sc $sc_name -n $ns -o jsonpath="{.metadata.resourceVersi
 # ctrl-dep: pvc-cec8e86d-0bcc-11e8-be1c-000c298ff5fc-ctrl       # 
 #################################################################
 
-c_dep=$(echo $pv-ctrl)
-r_dep=$(echo $pv-rep)
-c_svc=$(echo $c_dep-svc)
+c_dep=$(kubectl get deploy -n $ns -l openebs.io/persistent-volume=$pv,openebs.io/controller=jiva-controller -o jsonpath="{.items[*].metadata.name}")
+r_dep=$(kubectl get deploy -n $ns -l openebs.io/persistent-volume=$pv,openebs.io/replica=jiva-replica -o jsonpath="{.items[*].metadata.name}")
+c_svc=$(kubectl get svc -n $ns -l openebs.io/persistent-volume=$pv -o jsonpath="{.items[*].metadata.name}")
 c_name=$(echo $c_dep-con)
 r_name=$(echo $r_dep-con)
 
@@ -91,8 +95,8 @@ done
 # deleted before upgrading. If not deleted, the new pods will be stuck in 
 # creating state - due to affinity rules. 
 
-c_rs=$(kubectl get rs -o name --namespace $ns | grep $c_dep | cut -d '/' -f 2)
-r_rs=$(kubectl get rs -o name --namespace $ns | grep $r_dep | cut -d '/' -f 2)
+c_rs=$(kubectl get rs -o name --namespace $ns -l openebs.io/persistent-volume=$pv | grep $c_dep | cut -d '/' -f 2)
+r_rs=$(kubectl get rs -o name --namespace $ns -l openebs.io/persistent-volume=$pv | grep $r_dep | cut -d '/' -f 2)
 
 ################################################################ 
 # STEP: Update patch files with appropriate resource names     #
@@ -108,8 +112,8 @@ kubectl get deployment $c_dep -n $ns &>/dev/null
 rc=$?; if [ $rc -ne 0 ]; then echo "Target deployment not found: $rc"; exit; fi
 
 openebs_version=`kubectl get deployment $c_dep -n $ns -o jsonpath='{.metadata.labels.openebs\.io/version}'`
-if [ $openebs_version != "0.8.0" ]; then
-    echo "Current volumes version is not 0.8.0";exit 1;    
+if [ $openebs_version != $Current_version ]; then
+    echo "Current volumes version is not $Current_version";exit 1;    
 fi
 
 kubectl get deployment $r_dep -n $ns &>/dev/null
@@ -118,16 +122,16 @@ rc=$?; if [ $rc -ne 0 ]; then echo "Replica deplyment not found $rc"; exit; fi
 kubectl get svc $c_svc -n $ns &>/dev/null
 rc=$?; if [ $rc -ne 0 ]; then echo "Service not found: $rc"; exit; fi
 
-sed "s/@sc_name/$sc_name/g" jiva-replica-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" | sed -u "s/@replica_node_label/$replica_node_label/g" | sed -u "s/@r_name/$r_name/g" | sed -u "s/@pv-name/$pv/g" > jiva-replica-patch.json
-sed "s/@sc_name/$sc_name/g" jiva-target-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" | sed -u "s/@c_name/$c_name/g" > jiva-target-patch.json
-sed "s/@sc_name/$sc_name/g" jiva-target-svc-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" > jiva-target-svc-patch.json
+sed "s/@sc_name/$sc_name/g" jiva-replica-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" | sed -u "s/@replica_node_label/$replica_node_label/g" | sed -u "s/@r_name/$r_name/g" | sed -u "s/@pv-name/$pv/g" | sed -u "s/@target_version/$Target_upgrade_version/g"  > jiva-replica-patch.json
+sed "s/@sc_name/$sc_name/g" jiva-target-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" | sed -u "s/@c_name/$c_name/g" | sed -u "s/@target_version/$Target_upgrade_version/g" > jiva-target-patch.json
+sed "s/@sc_name/$sc_name/g" jiva-target-svc-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" | sed -u "s/@target_version/$Target_upgrade_version/g" > jiva-target-svc-patch.json
 
 #################################################################################
 # STEP: Patch OpenEBS volume deployments (jiva-target, jiva-replica & jiva-svc) #  
 #################################################################################
 
 # PATCH JIVA REPLICA DEPLOYMENT ####
-echo "Upgrading Replica Deployment to 0.8.1"
+echo "Upgrading Replica Deployment to $Target_upgrade_version"
 
 # Setting the update stratergy to recreate
 setDeploymentRecreateStrategy $ns $r_dep
@@ -143,7 +147,7 @@ rc=$?; if [[ ($rc -ne 0) || !($rollout_status =~ "successfully rolled out") ]];
 then echo " Upgrade failed | ERROR: $rc"; exit; fi
 
 # #### PATCH TARGET DEPLOYMENT ####
-echo "Upgrading Target Deployment to 0.8.1"
+echo "Upgrading Target Deployment to $Target_upgrade_version"
 
 # Setting the update stratergy to recreate
 setDeploymentRecreateStrategy $ns $c_dep
@@ -160,7 +164,7 @@ then echo " Upgrade failed | ERROR: $rc"; exit; fi
 
 
 # #### PATCH TARGET SERVICE ####
-echo "Upgrading Target Service to 0.8.1"
+echo "Upgrading Target Service to $Target_upgrade_version"
 kubectl patch service --namespace $ns $c_svc -p "$(cat jiva-target-svc-patch.json)"
 rc=$?; if [ $rc -ne 0 ]; then echo " Upgrade failed | ERROR: $rc"; exit; fi
 
@@ -169,6 +173,6 @@ rm jiva-replica-patch.json
 rm jiva-target-patch.json
 rm jiva-target-svc-patch.json
 
-echo "Successfully upgraded $pv to 0.8.1 Please run your application checks."
+echo "Successfully upgraded $pv to $Target_upgrade_version Please run your application checks."
 exit 0
 

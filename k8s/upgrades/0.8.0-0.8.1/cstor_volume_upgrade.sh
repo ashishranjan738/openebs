@@ -6,6 +6,9 @@
 # NOTES: Obtain the pv to upgrade via "kubectl get pv"         #
 ################################################################
 
+Target_upgrade_version="v0.8.1"
+Current_version="0.8.0"
+
 function usage() {
     echo 
     echo "Usage:"
@@ -22,10 +25,11 @@ function setDeploymentRecreateStrategy() {
     dns=$1 # deployment namespace
     dn=$2  # deployment name
     currStrategy=`kubectl get deploy -n $dns $dn -o jsonpath="{.spec.strategy.type}"`
+    rc=$?; if [ $rc -ne 0 ]; then echo "Failed to get the update stratergy for $dn | ERROR: $rc"; exit; fi
 
-    if [ $currStrategy = "RollingUpdate" ]; then
+    if [ $currStrategy != "Recreate" ]; then
        kubectl patch deployment --namespace $dns --type json $dn -p "$(cat patch-strategy-recreate.json)"
-       rc=$?; if [ $rc -ne 0 ]; then echo "Upgrade failed | ERROR: $rc"; exit; fi
+       rc=$?; if [ $rc -ne 0 ]; then echo "Upgrade failed for $dn | ERROR: $rc"; exit; fi
        echo "Deployment upgrade strategy set as recreate"
     else
        echo "Deployment upgrade strategy was already set as recreate"
@@ -64,8 +68,8 @@ sc_res_ver=`kubectl get sc $sc_name -n $sc_ns -o jsonpath="{.metadata.resourceVe
 # c-dep: pvc-cec8e86d-0bcc-11e8-be1c-000c298ff5fc-target        # 
 #################################################################
 
-c_dep=$(echo $pv-target)
-c_svc=$(echo $pv)
+c_dep=$(kubectl get deploy -n $ns -l openebs.io/persistent-volume=$pv,openebs.io/target=cstor-target -o jsonpath="{.items[*].metadata.name}")
+c_svc=$(kubectl get svc -n $ns -l openebs.io/persistent-volume=$pv,openebs.io/target-service=cstor-target-svc -o jsonpath="{.items[*].metadata.name}")
 c_vol=$(echo $pv)
 
 # Check if openebs resources exist and provisioned version is 0.8
@@ -74,8 +78,8 @@ kubectl get deployment $c_dep -n $ns &>/dev/null
 rc=$?; if [ $rc -ne 0 ]; then echo "Target deployment not found: $rc"; exit; fi
 
 openebs_version=`kubectl get deployment $c_dep -n $ns -o jsonpath='{.metadata.labels.openebs\.io/version}'`
-if [ $openebs_version != "0.8.0" ]; then
-    echo "Current volumes version is not 0.8.0";exit 1;    
+if [ $openebs_version != $Current_version ]; then
+    echo "Current volumes version is not $Current_version";exit 1;    
 fi
 
 kubectl get svc $c_svc -n $ns &>/dev/null
@@ -97,10 +101,10 @@ c_rs=$(kubectl get rs -o name --namespace $ns | grep $c_dep | cut -d '/' -f 2)
 # previous step                                                #  
 ################################################################
 
-sed "s/@sc_name/$sc_name/g" cstor-target-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" > cstor-target-patch.json
-sed "s/@sc_name/$sc_name/g" cstor-target-svc-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" > cstor-target-svc-patch.json
-sed "s/@sc_name/$sc_name/g" cstor-volume-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" > cstor-volume-patch.json
-sed "s/@sc_name/$sc_name/g" cstor-volume-replica-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" > cstor-volume-replica-patch.json
+sed "s/@sc_name/$sc_name/g" cstor-target-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" | sed -u "s/@target_version/$Target_upgrade_version/g" > cstor-target-patch.json
+sed "s/@sc_name/$sc_name/g" cstor-target-svc-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" | sed -u "s/@target_version/$Target_upgrade_version/g" > cstor-target-svc-patch.json
+sed "s/@sc_name/$sc_name/g" cstor-volume-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" | sed -u "s/@target_version/$Target_upgrade_version/g" > cstor-volume-patch.json
+sed "s/@sc_name/$sc_name/g" cstor-volume-replica-patch.tpl.json | sed -u "s/@sc_resource_version/$sc_res_ver/g" | sed -u "s/@target_version/$Target_upgrade_version/g" > cstor-volume-replica-patch.json
 
 #################################################################################
 # STEP: Patch OpenEBS volume deployments (cstor-target, cstor-svc)              #  
@@ -108,7 +112,7 @@ sed "s/@sc_name/$sc_name/g" cstor-volume-replica-patch.tpl.json | sed -u "s/@sc_
 
 
 # #### PATCH TARGET DEPLOYMENT ####
-echo "Upgrading Target Deployment to 0.8.1"
+echo "Upgrading Target Deployment to $Target_upgrade_version"
 
 # Setting deployment startegy to recreate
 setDeploymentRecreateStrategy $ns $c_dep
@@ -116,30 +120,25 @@ setDeploymentRecreateStrategy $ns $c_dep
 kubectl patch deployment  --namespace $ns $c_dep -p "$(cat cstor-target-patch.json)" 
 rc=$?; if [ $rc -ne 0 ]; then echo "Upgrade failed | ERROR: $rc"; exit; fi
 
-
-
 kubectl delete rs $c_rs --namespace $ns
 rc=$?; if [ $rc -ne 0 ]; then echo "Upgrade failed | ERROR: $rc"; exit; fi
-
 
 rollout_status=$(kubectl rollout status --namespace $ns  deployment/$c_dep)
 rc=$?; if [[ ($rc -ne 0) || !($rollout_status =~ "successfully rolled out") ]];
 then echo "Upgrade failed | ERROR: $rc"; exit; fi
 
-
-
 # #### PATCH TARGET SERVICE ####
-echo "Upgrading Target Service to 0.8.1"
+echo "Upgrading Target Service to $Target_upgrade_version"
 kubectl patch service --namespace $ns $c_svc -p "$(cat cstor-target-svc-patch.json)"
 rc=$?; if [ $rc -ne 0 ]; then echo "Upgrade failed | ERROR: $rc"; exit; fi
 
 # #### PATCH CSTOR Volume CR ####
-echo "Upgrading cstor volume CR to 0.8.1"
+echo "Upgrading cstor volume CR to $Target_upgrade_version"
 kubectl patch cstorvolume --namespace $ns $c_svc -p "$(cat cstor-volume-patch.json)" --type=merge
 rc=$?; if [ $rc -ne 0 ]; then echo "Upgrade failed | ERROR: $rc"; exit; fi
 
 # #### PATCH CSTOR Volume Replica CR ####
-echo "Upgrading cstor volume replicas CR to 0.8.1"
+echo "Upgrading cstor volume replicas CR to $Target_upgrade_version"
 replicas=$(kubectl get cvr -n $ns -l cstorvolume.openebs.io/name=$pv -o jsonpath="{range .items[*]}{@.metadata.name};{end}" | tr ";" "\n")
 
 for replica in $replicas
@@ -156,6 +155,6 @@ rm cstor-target-svc-patch.json
 rm cstor-volume-patch.json
 rm cstor-volume-replica-patch.json
 
-echo "Successfully upgraded $pv to 0.8.1 Please run your application checks."
+echo "Successfully upgraded $pv to $Target_upgrade_version Please run your application checks."
 exit 0
 
